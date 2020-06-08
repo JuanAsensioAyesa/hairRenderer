@@ -29,12 +29,15 @@
 #include "yocto_pathtrace.h"
 
 #include <yocto/yocto_shape.h>
+#include <yocto_extension/yocto_extension.h>
 
 #include <atomic>
 #include <deque>
 #include <future>
+#include <iostream>
 #include <memory>
 #include <mutex>
+
 using namespace std::string_literals;
 
 // -----------------------------------------------------------------------------
@@ -363,6 +366,9 @@ static brdf eval_brdf(const ptr::object* object, int element, const vec2f& uv,
   auto texcoord = eval_texcoord(object, element, uv);
   auto base     = material->color *
               eval_texture(material->color_tex, texcoord, false);
+  // if (!object->shape->lines.empty()) {
+  //   base = {1, 1, 1};
+  // }
   auto specular = material->specular *
                   eval_texture(material->specular_tex, texcoord, true).x;
   auto metallic = material->metallic *
@@ -442,6 +448,9 @@ static vsdf eval_vsdf(const ptr::object* object, int element, const vec2f& uv) {
   auto texcoord = eval_texcoord(object, element, uv);
   auto base     = material->color *
               eval_texture(material->color_tex, texcoord, false);
+  if (!object->shape->lines.empty()) {
+    base = {1, 1, 1};
+  }
   auto transmission = material->transmission *
                       eval_texture(material->emission_tex, texcoord, true).x;
   auto thin       = material->thin || !material->transmission;
@@ -1162,12 +1171,14 @@ static float sample_scattering_pdf(
 static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
     rng_state& rng, const trace_params& params) {
   // initialize
+  // tryReciprocity();
   auto radiance     = zero3f;
   auto weight       = vec3f{1, 1, 1};
   auto ray          = ray_;
   auto volume_stack = std::vector<vsdf>{};
   auto hit          = false;
-
+  // std::cout << yocto::extension::Pow<3>(2.f) << std::endl;
+  // std::cout << yocto::extension::Pow<0>(2.f) << std::endl;
   // trace  path
   for (auto bounce = 0; bounce < params.bounces; bounce++) {
     // intersect next point
@@ -1216,16 +1227,57 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
       // next direction
       auto incoming = zero3f;
       if (!is_delta(brdf)) {
-        if (rand1f(rng) < 0.5f) {
-          incoming = sample_brdfcos(
-              brdf, normal, outgoing, rand1f(rng), rand2f(rng));
+        // pelo
+        vec3f faux;
+        float pdf;
+        if (!object->shape->lines.empty()) {
+          // std::cout << "empezamos a carburar" << std::flush;
+          vec3f color = object->material->color;
+          if (true) {
+            // std::cout << color.x << " " << color.y << " " << color.z
+            //          << std::endl;
+            // float sigmaAux[3] = {color[0], color[1], color[2]};
+
+            float sigmaAux[3] = {color[0], color[1], color[2]};
+
+            // pbrt::Spectrum sigma       = 50;
+            // pbrt::Spectrum::FromRGB(sigmaAux)
+            yocto::extension::HairBSDF h = yocto::extension::HairBSDF(
+                -1 + 2 * rand1f(rng), 1.55, pbrt::Spectrum::FromRGB(sigmaAux),
+                0.3, 0.6, 2);
+
+            pbrt::Spectrum f = h.Sample_f(
+                outgoing, &incoming, yocto::math::rand2f(rng), &pdf);
+
+            // std::cout << "PDF " << pdf << std::endl;
+            // std::cout << "F " << f << std::endl;
+            if (f.IsBlack() || pdf == 0.f || std::isnan(pdf)) break;
+            // incoming = transform_direction(basis_fromz(normal), incoming);
+            faux[0] = f[0];
+            faux[1] = f[1];
+            faux[2] = f[2];
+          } else {
+            incoming = sample_lights(
+                scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+          }
+
+          vec3f brown = vec3f(0.502, 0.251, 0);
+          weight *= (faux)*abs(yocto::math::dot(incoming, normal)) /
+                    (pdf + sample_lights_pdf(scene, position, incoming));
+
         } else {
-          incoming = sample_lights(
-              scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+          if (rand1f(rng) < 0.5f) {
+            incoming = sample_lights(
+                scene, position, rand1f(rng), rand1f(rng), rand2f(rng));
+          } else {
+            incoming = sample_brdfcos(
+                brdf, normal, outgoing, rand1f(rng), rand2f(rng));
+          }
+          weight *=
+              eval_brdfcos(brdf, normal, outgoing, incoming) /
+              (0.5f * sample_brdfcos_pdf(brdf, normal, outgoing, incoming) +
+                  0.5f * sample_lights_pdf(scene, position, incoming));
         }
-        weight *= eval_brdfcos(brdf, normal, outgoing, incoming) /
-                  (0.5f * sample_brdfcos_pdf(brdf, normal, outgoing, incoming) +
-                      0.5f * sample_lights_pdf(scene, position, incoming));
       } else {
         incoming = sample_delta(brdf, normal, outgoing, rand1f(rng));
         weight *= eval_delta(brdf, normal, outgoing, incoming) /
@@ -1285,7 +1337,7 @@ static vec4f trace_path(const ptr::scene* scene, const ray3f& ray_,
   }
 
   return {radiance, hit ? 1.0f : 0.0f};
-}
+}  // namespace yocto::pathtrace
 
 // Recursive path tracing.
 static vec4f trace_naive(const ptr::scene* scene, const ray3f& ray_,
